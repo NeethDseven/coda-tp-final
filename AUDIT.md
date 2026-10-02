@@ -2,47 +2,35 @@
 
 ## 1. Comportement observable
 
-au lancement de index.php : 4 lignes observable
-Le paiement Stripe est simulé pour 143,82 €.
-La sauvegarde affiche la réservation 1001 avec le statut confirmed.
-L’envoi d’un email à <lea@example.com> est simulé.
-Le total final est 143,82 €, soit deux billets à 79,90 € avec 10 % de remise VIP.
-Aucune erreur apparente dans cette sortie.
+`BookingService::confirm()` fait tout, dans cet ordre : validation, calcul du total, remises, paiement, statut `confirmed`, « insertion SQL » (un `echo`), e-mail (un `echo`).
 
-au lancement de characterization.php : Passed: 4, Failed: 0
-Les quatre vérifications passent : total d’un client standard, passage au statut confirmed, remise VIP actuelle de 10 % et réduction actuelle de 10 € pour le Pass 3 jours.
+- Remise VIP : −10 %. Remise pass 3 jours : −10 €.
+- Paiement : Stripe fonctionne, PayFast lève « not implemented ».
+- `php index.php` affiche `TOTAL FINAL: 143.82`.
+- Les 3 tests actuels figent : standard = 100 €, VIP = 90 €, pass 3 jours = 110 €.
+- `SmsClient`, `LoyaltyService`, `AnalyticsClient` et `PayFastSdk` ne sont jamais appelés.
 
 ## 2. Problèmes identifiés
 
-| Problème | Catégorie | Constat |
-| Responsabilités regroupées dans BookingService | Conception | La méthode confirm() valide la réservation, calcule le total, applique les remises, déclenche le paiement, change le statut, simule la sauvegarde et envoie l’email. |
-| Dépendances créées directement | Couplage | BookingService instancie StripeClient et EmailService dans confirm(), sans injection de dépendances. |
-| Règles de remise codées en dur | Règles métier | La remise VIP de 10 % et la réduction de 10 € du Pass 3 jours sont définies directement dans confirm(). |
-| Prix des billets non validés | Validation | Ticket accepte un prix de type float sans contrôle ; confirm() vérifie la quantité, mais ne vérifie pas le prix. |
-| Total négatif possible | Calcul du montant | La réduction de 10 € du Pass 3 jours est soustraite sans contrôle du montant final ; un total initial inférieur à 10 € devient négatif. |
-| Montants calculés en nombres flottants | Précision monétaire | Les prix et le total utilisent le type float ; aucun arrondi monétaire explicite n’est appliqué avant le paiement. |
-| Confirmation répétée possible | Gestion du statut | confirm() ne vérifie pas le statut initial de la réservation ; une réservation déjà confirmed peut déclencher à nouveau le paiement et l’email. |
-| Paiement PayFast non implémenté | Fonctionnalité | La branche payfast lève systématiquement l’exception « PayFast not implemented ». |
-| Sauvegarde simulée | Persistance | La sauvegarde de la réservation se limite à un echo de « SQL INSERT » ; aucune requête SQL n’est exécutée dans confirm(). |
-| État de la réservation modifiable directement | Encapsulation | Les propriétés items, status et passType de Booking sont publiques et peuvent être modifiées directement. |
-| Couverture des tests limitée | Tests | Les quatre vérifications couvrent le total standard, le statut confirmé et les deux remises séparément ; les erreurs de validation, le cumul des remises, les moyens de paiement et la confirmation répétée ne sont pas testés. |
+| # | Problème | Catégorie | Impact |
+|---|---|---|---|
+| 1 | `confirm()` fait tout : validation, prix, paiement, persistance, notification. | SRP | Toute évolution touche cette méthode, et elle est difficile à tester. |
+| 2 | `StripeClient` et `EmailService` sont créés avec `new` dans la méthode. | DIP | Impossible de les remplacer ou de les simuler. |
+| 3 | Le moyen de paiement est choisi par un `if/elseif` sur une chaîne, et PayFast n'est pas branché. | OCP | Chaque nouveau paiement oblige à modifier `confirm()`. |
+| 4 | Les remises sont codées en dur, cumulables, sans plancher. | OCP | Le total peut être ≤ 0, et Stripe lève alors `Invalid amount`. |
+| 5 | Chaînes magiques (`'vip'`, `'3days'`) et montants en `float`. | Modélisation | Une faute de frappe passe sans erreur, les arrondis sont imprécis, et PayFast attend des centimes. |
+| 6 | Les effets de bord sont des `echo`, 3 services sont inutilisés et les tests ne couvrent que le cas nominal. | Testabilité | Impossible de vérifier la persistance ou les notifications, et les cas d'erreur ne sont pas testés. |
 
 ## 3. Nos trois priorités
 
-1/Compléter les tests de caractérisation : protéger les comportements actuels avant les refactorings. Sans ces tests, une modification pourrait introduire une régression non détectée.
-
-2/Sécuriser les montants et la confirmation : contrôler les prix, empêcher les montants négatifs et la confirmation répétée d’une réservation. Ces problèmes peuvent entraîner des totaux incorrects ou des paiements répétés.
-
-3/Séparer les responsabilités de BookingService : isoler la tarification, le paiement et les actions après confirmation pour faciliter les évolutions. Actuellement, modifier une règle risque d’affecter les autres traitements.
+1. **Abstractions et injection de dépendances** : une interface de paiement (Stripe et un adaptateur PayFast), injectée dans `BookingService`. Corrige les problèmes 1, 2 et 3.
+2. **Remises en règles séparées** : une règle par remise, avec un total jamais négatif. Corrige le problème 4.
+3. **Modèle et tests** : enums, montants en centimes, notifications branchées, tests complétés. Corrige les problèmes 5 et 6.
 
 ## 4. Risques avant refactoring
 
-- Régression sur la tarification : déplacer le calcul du total pourrait  modifier les remises actuelles ou leur ordre d’application. Les tests  doivent protéger le comportement initial avant de faire évoluer les règles.
-
-- Modification du déroulement de la confirmation : séparer les responsabilités pourrait changer l’ordre paiement, changement de statut, sauvegarde et email. Une réservation ne doit pas être confirmée si le paiement échoue.
-
-- Perte ou duplication d’actions : réorganiser la confirmation pourrait supprimer l’envoi de l’email ou déclencher plusieurs fois le paiement et les notifications.
-
-- Erreurs sur les montants : modifier les calculs ou convertir les euros en centimes pour PayFast pourrait introduire des erreurs d’arrondi ou de conversion.
-
-- Régressions non détectées : les quatre tests actuels ne couvrent pas les erreurs de validation, le cumul des remises ou la confirmation répétée. Il faut compléter ces tests avant les modifications importantes.
+- **Tests à adapter :** ils figent les anciennes règles de remise, qui doivent évoluer.
+- **Arrondis :** passer aux centimes peut décaler les totaux de quelques centimes.
+- **`PayFastSdk` non modifiable :** l'adaptateur doit tout absorber (centimes, devise, référence, échec).
+- **Paiement avant confirmation :** si l'insertion ou l'e-mail échoue après le paiement, le client est débité sans réservation.
+- **Tests manquants :** validation, PayFast, cumul des remises, total ≤ 0. À écrire avant de toucher au code.
